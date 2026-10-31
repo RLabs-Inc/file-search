@@ -39,22 +39,34 @@ The phrase after `-find` doesn't need quotes. Everything up to the next option i
 
 ## What gets searched
 
-**Every needle is matched as:** UTF-8 text · UTF-16LE · UTF-16BE · hex text
-(`50 68 6f…`, `50:68:6f`, `50686f`) · base64 at all 3 byte alignments ·
-digits with any separators · date notations.
+### How the text is matched
 
-**Containers & formats are decoded recursively, detected by content (not extension):**
+| | |
+|---|---|
+| **Case & accents** | case- and accent-insensitive by default: `São Paulo` = `Sao Paulo` = `SÃO PAULO` (`-c` / `--accents` to be strict) |
+| **Unicode forms** | precomposed (NFC) and decomposed (NFD, e.g. macOS file names) both match |
+| **Encodings** | UTF-8 · UTF-16LE · UTF-16BE · and legacy code pages chosen from the needle's script: cp1252 & Mac Roman (Western), cp1250/ISO-8859-2 (Central European), cp1254 (Turkish), cp1251/KOI8-R/KOI8-U/IBM866 (Cyrillic), cp1253 (Greek), cp1255 (Hebrew), cp1256 (Arabic), cp874 (Thai), cp1258 (Vietnamese), Shift_JIS/EUC-JP (Japanese), GB18030/Big5 (Chinese), EUC-KR (Korean) |
+| **Encoded forms** | hex text (`50 68 6f…`, `50:68:6f`, `50686f`) · base64 at all 3 byte alignments (shown decoded) |
+| **Numbers** | digits with any separators: `11987654321` = `(11) 98765-4321` = `11.98765.4321` |
+| **Dates** | 20+ notations (`15/03/2024`, `March 15, 2024`, `15 de março de 2024`, EXIF `2024:03:15`…) **and numeric timestamps of that day anywhere**: Unix s/ms/µs, Apple/Cocoa s & ns (2001 epoch), Chrome/WebKit µs, Windows FILETIME, HFS+ (1904 epoch) |
+
+### Formats decoded (recursively, detected by content, never by extension)
 
 | Kind | What happens |
 |---|---|
-| gzip, bzip2, xz, lzma, zstd, zlib | decompressed and searched |
-| zip (docx, xlsx, pptx, odt, epub, jar, ipa…), tar | every entry searched, plus entry names |
+| gzip, bzip2, xz, lzma, zstd, zlib, LZ4, **Apple LZFSE / LZ4** (`compression_tool`), Snappy | decompressed and searched |
+| gzip streams **inside** binaries | carved out of caches, blobs and journals and inflated |
+| zip (docx, xlsx, pptx, odt, epub, jar, ipa…), tar, **7z**, **cab**, **cpio** | every entry searched, plus entry names |
+| **OLE / Compound File** (legacy .doc .xls .ppt, Outlook .msg, Thumbs.db) | every stream reassembled from its sectors (lenient reader: works on files strict parsers reject) |
 | binary plist | every key / string / number / date walked; `Data` blobs decoded recursively (nested plists, NSKeyedArchiver) |
-| SQLite | every table, row and cell (`sqlite:message[rowid 42].text`); blobs decoded; timestamp columns rendered as dates; **raw hits outside live rows are flagged as deleted / free-space leftovers** |
+| **typedstream** (iMessage `attributedBody`) | message strings extracted |
+| SQLite | every table, row and cell (`sqlite:message[rowid 42].text`); blobs decoded; numbers that are timestamps rendered as dates; **raw hits outside live rows are flagged as deleted / free-space leftovers** |
 | SQLite WAL | hits mapped to WAL frame and page number |
+| **LevelDB / RocksDB** (.ldb/.sst: Chrome, Edge, Electron apps such as Slack, Discord, VS Code, WhatsApp, Teams) | blocks decompressed (Snappy, LZ4, zstd), keys and values searched |
 | PDF | FlateDecode streams inflated; text extracted from `Tj`/`TJ` operators |
+| **RTF** | control words dropped, `\'hh` (any code page) and `\uN` decoded |
 | XML / HTML / Office XML | markup stripped and entities decoded, so `<w:t>Phoe</w:t><w:t>nix</w:t>` matches "Phoenix" |
-| email | quoted-printable decoded; MIME base64 bodies decoded |
+| email | quoted-printable, MIME base64 bodies, **RFC 2047 headers** (`=?UTF-8?B?…?=`) |
 | JSON / code | `\uXXXX`, `\xXX` escapes decoded |
 | logs / URLs | percent-encoding decoded |
 | anything text | embedded base64 blobs (≥ 64 chars, line breaks allowed) decoded and searched recursively |
@@ -97,6 +109,7 @@ still writes every report (exit code 130). Press it twice to abort immediately.
 --formats <list>        csv,txt,jsonl,html,md (default: all)
 --no-export             screen only
 -c, --case              case-sensitive
+-a, --accents           accent-sensitive
 -r, --regex             regular expression
 -x, --hex               hex bytes
 -C, --context <n>       context characters per side (default 40)
@@ -121,12 +134,15 @@ still writes every report (exit code 130). Press it twice to abort immediately.
 - The export folder is automatically excluded from the search.
 - On macOS, protected folders (Mail, Messages, Safari…) need *Full Disk Access*
   for your terminal, or `sudo`.
-- Not decoded (yet): encrypted archives, Snappy (Chrome LevelDB), PDF text in
-  fonts without a Unicode map, OCR of images.
+- Binary serialization formats (protobuf, MessagePack, BSON, CBOR, Apple Biome/SEGB,
+  EXIF/MP4/ID3 metadata) store strings as plain UTF-8/UTF-16 bytes, so their text
+  is already found by the raw scan; only their binary-encoded numbers and dates aren't.
+- Not decoded (yet): encrypted archives and keychains, RAR, disk images (dmg),
+  brotli, PDF text in fonts without a Unicode map, OCR of images.
 
 ## Development
 
 ```sh
 cargo test                 # unit tests (matcher shapes, decoders, timestamps)
-./scripts/selftest.sh      # end-to-end: hides the needle in 27 formats and checks each is found
+./scripts/selftest.sh      # end-to-end: 50 checks across formats, encodings, accents and dates
 ```

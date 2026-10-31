@@ -10,7 +10,7 @@ use std::time::{Instant, SystemTime};
 
 use crossbeam_channel::Sender;
 
-use crate::decode::{self, Format};
+use crate::formats::{self, archive, compress, text, time, Format};
 use crate::hit::{clean, render_context, Hit, Loc, Seg};
 use crate::matcher::{Kind, Matcher};
 
@@ -387,13 +387,13 @@ impl<'a, 'w> FileScan<'a, 'w> {
         }
         let cfg = self.w.cfg;
         let can_decode = cfg.decode && depth < cfg.max_depth && (data.len() as u64) <= cfg.max_decode;
-        let fmt = if can_decode { decode::detect(data) } else { Format::Other };
+        let fmt = if can_decode { formats::detect(data) } else { Format::Other };
 
-        // Fully structured containers replace the raw pass (avoids duplicate hits).
+        // Containers that decode fully replace the raw pass (no duplicate hits);
+        // if they fail to open we fall through and scan the bytes raw.
         let structured = match fmt {
             Format::BPlist => self.scan_bplist(data, loc, depth),
-            Format::Zip => self.scan_zip(data, loc, depth),
-            Format::Tar => self.scan_tar(data, loc, depth),
+            f if f.is_container() => self.scan_children(f, data, loc, depth),
             _ => false,
         };
         if structured {
@@ -405,8 +405,8 @@ impl<'a, 'w> FileScan<'a, 'w> {
             _ => None,
         };
 
-        let texty = decode::is_texty(data);
-        let blobs = if can_decode && texty { decode::base64_blobs(data, 64, 5000) } else { Vec::new() };
+        let texty = text::is_texty(data);
+        let blobs = if can_decode && texty { text::base64_blobs(data, 64, 5000) } else { Vec::new() };
 
         // ── raw pass ──
         let mut matches = Vec::new();
@@ -426,10 +426,7 @@ impl<'a, 'w> FileScan<'a, 'w> {
                 continue; // the decoded blob scan below reports it with readable context
             }
             let ctx = render_context(data, r.start, r.end, r.kind, cfg.context);
-            let mut detail = physical(fmt, data, r.start);
-            if r.kind == Kind::Base64 {
-                detail = decode::base64_run_text(data, r.start, r.end).map(|t| format!("decodes to “{t}”"));
-            }
+            let mut detail = kind_detail(data, r).or_else(|| physical(fmt, data, r.start));
             if let Some(cells) = &live_cells {
                 if is_live(&ctx, cells) {
                     continue; // already reported from the table row
@@ -465,11 +462,11 @@ impl<'a, 'w> FileScan<'a, 'w> {
             }
         }
 
-        // ── derived text views (markup, quoted-printable, url, escapes, pdf text) ──
+        // ── derived text views (markup, quoted-printable, url, escapes, pdf, mime, rtf) ──
         if texty && data.len() <= VIEW_LIMIT {
             covered.sort_unstable();
             let base_len = covered.len();
-            for view in decode::derived_views(data) {
+            for view in text::derived_views(data) {
                 let mut found = Vec::new();
                 self.w.m.for_each(&view.data, |r| {
                     found.push(r);
@@ -486,24 +483,29 @@ impl<'a, 'w> FileScan<'a, 'w> {
                     }
                     covered.push((os, oe));
                     let ctx = render_context(&view.data, r.start, r.end, r.kind, cfg.context);
-                    if !self.emit(&child, r.kind.label().to_string(), os, None, None, ctx) {
+                    let detail = kind_detail(&view.data, r);
+                    if !self.emit(&child, r.kind.label().to_string(), os, None, detail, ctx) {
                         return;
                     }
                 }
             }
         }
 
-        // ── compressed streams & documents ──
+        // ── documents & carving ──
         match fmt {
-            Format::Gzip | Format::Bzip2 | Format::Xz | Format::Lzma | Format::Zstd | Format::Zlib => {
-                if let Some(dec) = decode::decompress(fmt, data, cfg.decomp_cap) {
-                    let child = loc.child(Seg::Str(fmt.label()));
+            Format::Pdf => {
+                for (off, dec) in archive::pdf_streams(data, cfg.decomp_cap, 20_000) {
+                    let child = loc.child(Seg::Owned(format!("pdf-stream@0x{off:x}")));
                     self.scan_buffer(&dec, &child, depth + 1, None);
+                    if self.stop() {
+                        return;
+                    }
                 }
             }
-            Format::Pdf => {
-                for (off, dec) in decode::pdf_streams(data, cfg.decomp_cap, 20_000) {
-                    let child = loc.child(Seg::Owned(format!("pdf-stream@0x{off:x}")));
+            // gzip streams hidden inside binaries (caches, blobs, journals)
+            Format::Other | Format::SqliteWal if !texty => {
+                for (off, dec) in compress::carve_gzip(data, cfg.decomp_cap, 2_000) {
+                    let child = loc.child(Seg::Owned(format!("gzip@0x{off:x}")));
                     self.scan_buffer(&dec, &child, depth + 1, None);
                     if self.stop() {
                         return;
@@ -514,52 +516,21 @@ impl<'a, 'w> FileScan<'a, 'w> {
         }
     }
 
-    // ── archives ──
-
-    fn scan_zip(&mut self, data: &[u8], loc: &Loc, depth: usize) -> bool {
-        let Ok(mut z) = zip::ZipArchive::new(Cursor::new(data)) else { return false };
-        for i in 0..z.len() {
-            if self.stop() {
-                break;
+    /// Streams, archives and other containers: scan every child they yield.
+    fn scan_children(&mut self, fmt: Format, data: &[u8], loc: &Loc, depth: usize) -> bool {
+        let cap = self.w.cfg.decomp_cap;
+        let entry_method = format!("{} entry name", fmt.label());
+        formats::children(fmt, data, cap, &mut |child| {
+            if let Some(name) = &child.name {
+                self.check_name(name, loc, &entry_method);
             }
-            let (name, buf) = {
-                let Ok(mut f) = z.by_index(i) else { continue };
-                if f.is_dir() {
-                    continue;
-                }
-                let name = f.name().map(|c| c.to_string()).unwrap_or_else(|_| format!("#{i}"));
-                let buf = decode::read_capped(&mut f, self.w.cfg.decomp_cap).unwrap_or_default();
-                (name, buf)
-            };
-            self.check_name(&name, loc, "zip entry name");
-            let label = format!("zip:{name}");
-            let child = loc.child(Seg::Owned(label));
-            self.set_inner(&child);
-            self.scan_buffer(&buf, &child, depth + 1, None);
-        }
-        true
-    }
-
-    fn scan_tar(&mut self, data: &[u8], loc: &Loc, depth: usize) -> bool {
-        let mut ar = tar::Archive::new(Cursor::new(data));
-        let Ok(entries) = ar.entries() else { return false };
-        for entry in entries {
-            if self.stop() {
-                break;
+            let l = loc.child(Seg::Owned(child.label));
+            if fmt.is_archive() {
+                self.set_inner(&l);
             }
-            let Ok(mut e) = entry else { break };
-            if !e.header().entry_type().is_file() {
-                continue;
-            }
-            let name = e.path().map(|p| p.display().to_string()).unwrap_or_default();
-            let buf = decode::read_capped(&mut e, self.w.cfg.decomp_cap).unwrap_or_default();
-            self.check_name(&name, loc, "tar entry name");
-            let label = format!("tar:{name}");
-            let child = loc.child(Seg::Owned(label));
-            self.set_inner(&child);
-            self.scan_buffer(&buf, &child, depth + 1, None);
-        }
-        true
+            self.scan_buffer(&child.data, &l, depth + 1, None);
+            !self.stop()
+        })
     }
 
     // ── binary plists ──
@@ -607,11 +578,11 @@ impl<'a, 'w> FileScan<'a, 'w> {
             V::Integer(i) => {
                 let n = i.as_signed().map(|x| x as f64).or(i.as_unsigned().map(|x| x as f64)).unwrap_or(0.0);
                 let key = path.last().map(String::as_str).unwrap_or("");
-                self.scan_number(&i.to_string(), n, decode::name_hints_time(key), loc, path);
+                self.scan_number(&i.to_string(), n, time::name_hints_time(key), loc, path);
             }
             V::Real(f) => {
                 let key = path.last().map(String::as_str).unwrap_or("");
-                self.scan_number(&f.to_string(), *f, decode::name_hints_time(key), loc, path);
+                self.scan_number(&f.to_string(), *f, time::name_hints_time(key), loc, path);
             }
             V::Date(d) => {
                 let st: SystemTime = (*d).into();
@@ -626,7 +597,7 @@ impl<'a, 'w> FileScan<'a, 'w> {
     }
 
     fn scan_number(&mut self, text: &str, v: f64, hinted: bool, loc: &Loc, path: &[String]) {
-        let s = match decode::timestamp_notes(v, hinted) {
+        let s = match time::timestamp_notes(v, hinted) {
             Some(n) => format!("{text} {n}"),
             None => text.to_string(),
         };
@@ -692,7 +663,7 @@ impl<'a, 'w> FileScan<'a, 'w> {
                             }
                         }
                         Ok(ValueRef::Integer(i)) => {
-                            let s = match decode::timestamp_notes(i as f64, decode::name_hints_time(col)) {
+                            let s = match time::timestamp_notes(i as f64, time::name_hints_time(col)) {
                                 Some(note) => format!("{i} {note}"),
                                 None => i.to_string(),
                             };
@@ -701,7 +672,7 @@ impl<'a, 'w> FileScan<'a, 'w> {
                             }
                         }
                         Ok(ValueRef::Real(f)) => {
-                            let s = match decode::timestamp_notes(f, decode::name_hints_time(col)) {
+                            let s = match time::timestamp_notes(f, time::name_hints_time(col)) {
                                 Some(note) => format!("{f} {note}"),
                                 None => f.to_string(),
                             };
@@ -718,6 +689,18 @@ impl<'a, 'w> FileScan<'a, 'w> {
             }
         }
         Some(live)
+    }
+}
+
+/// Extra explanation for matches whose raw form isn't self-explanatory.
+fn kind_detail(data: &[u8], r: crate::matcher::RawMatch) -> Option<String> {
+    match r.kind {
+        Kind::Base64 => text::base64_run_text(data, r.start, r.end).map(|t| format!("decodes to “{t}”")),
+        Kind::Timestamp => {
+            let n: f64 = std::str::from_utf8(&data[r.start..r.end]).ok()?.parse().ok()?;
+            time::timestamp_notes(n, true)
+        }
+        _ => None,
     }
 }
 

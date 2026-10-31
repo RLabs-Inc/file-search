@@ -137,6 +137,12 @@ pub fn render_context(data: &[u8], start: usize, end: usize, kind: Kind, ctx: us
             let after = decode_utf16(&data[end..e1 - ((e1 - end) % 2)], be);
             (clean(&last_chars(&before, ctx)), clean(&matched), clean(&first_chars(&after, ctx)))
         }
+        Kind::Legacy(enc) => {
+            let b0 = start.saturating_sub(ctx * 2);
+            let e1 = (end + ctx * 2).min(data.len());
+            let dec = |b: &[u8]| enc.decode_without_bom_handling(b).0.to_string();
+            (clean(&last_chars(&dec(&data[b0..start]), ctx)), clean(&dec(&data[start..end])), clean(&first_chars(&dec(&data[end..e1]), ctx)))
+        }
         Kind::HexBytes if !readable(&data[start..end]) => {
             let b0 = start.saturating_sub(ctx / 3);
             let e1 = (end + ctx / 3).min(data.len());

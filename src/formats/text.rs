@@ -1,145 +1,12 @@
-//! Format detection, decompressors and "derived views" of text.
-//!
-//! A derived view is a transformed copy of a buffer (markup stripped, URL
-//! decoded, …) plus a map from every output byte back to the original offset,
-//! so hits can be de-duplicated against the raw scan and reported precisely.
+//! Derived text views: transformed copies of a text buffer (markup stripped,
+//! URL decoded, …) plus a map from every output byte back to its original
+//! offset, so hits can be de-duplicated against the raw scan.
 
-use std::io::{Cursor, Read};
 use std::sync::LazyLock;
 
 use base64::Engine;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-use chrono::{DateTime, Local, TimeZone, Utc};
 use regex::bytes::Regex;
-
-// ── format detection ────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Format {
-    Gzip,
-    Bzip2,
-    Xz,
-    Lzma,
-    Zstd,
-    Zlib,
-    Zip,
-    Tar,
-    BPlist,
-    Sqlite,
-    SqliteWal,
-    Pdf,
-    Other,
-}
-
-impl Format {
-    pub fn label(self) -> &'static str {
-        match self {
-            Format::Gzip => "gzip",
-            Format::Bzip2 => "bzip2",
-            Format::Xz => "xz",
-            Format::Lzma => "lzma",
-            Format::Zstd => "zstd",
-            Format::Zlib => "zlib",
-            Format::Zip => "zip",
-            Format::Tar => "tar",
-            Format::BPlist => "bplist",
-            Format::Sqlite => "sqlite",
-            Format::SqliteWal => "sqlite-wal",
-            Format::Pdf => "pdf",
-            Format::Other => "",
-        }
-    }
-}
-
-pub fn detect(d: &[u8]) -> Format {
-    let starts = |m: &[u8]| d.starts_with(m);
-    if starts(&[0x1f, 0x8b]) {
-        Format::Gzip
-    } else if starts(b"BZh") && d.len() > 4 && d[3].is_ascii_digit() {
-        Format::Bzip2
-    } else if starts(&[0xFD, b'7', b'z', b'X', b'Z', 0]) {
-        Format::Xz
-    } else if starts(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        Format::Zstd
-    } else if starts(b"PK\x03\x04") || starts(b"PK\x05\x06") {
-        Format::Zip
-    } else if starts(b"bplist0") {
-        Format::BPlist
-    } else if starts(b"SQLite format 3\0") {
-        Format::Sqlite
-    } else if d.len() >= 32 && (starts(&[0x37, 0x7f, 0x06, 0x82]) || starts(&[0x37, 0x7f, 0x06, 0x83])) {
-        Format::SqliteWal
-    } else if starts(b"%PDF") {
-        Format::Pdf
-    } else if d.len() > 262 && &d[257..262] == b"ustar" {
-        Format::Tar
-    } else if d.len() > 13 && d[0] == 0x5D && d[1] == 0 && d[2] == 0 && (d[5..13] == [0xFF; 8] || d[12] == 0) {
-        Format::Lzma
-    } else if d.len() > 2 && d[0] == 0x78 && matches!(d[1], 0x01 | 0x5E | 0x9C | 0xDA) {
-        Format::Zlib
-    } else {
-        Format::Other
-    }
-}
-
-// ── decompression ───────────────────────────────────────────────────────
-
-/// Read up to `cap` bytes; a truncated/corrupt stream still yields what decoded.
-pub fn read_capped<R: Read>(mut r: R, cap: usize) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    while out.len() < cap {
-        match r.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n.min(cap - out.len())]),
-            Err(_) => break,
-        }
-    }
-    if out.is_empty() { None } else { Some(out) }
-}
-
-pub fn decompress(fmt: Format, d: &[u8], cap: usize) -> Option<Vec<u8>> {
-    match fmt {
-        Format::Gzip => read_capped(flate2::read::MultiGzDecoder::new(d), cap),
-        Format::Zlib => read_capped(flate2::read::ZlibDecoder::new(d), cap),
-        Format::Bzip2 => read_capped(bzip2::read::MultiBzDecoder::new(d), cap),
-        Format::Zstd => {
-            let dec = ruzstd::decoding::StreamingDecoder::new(Cursor::new(d)).ok()?;
-            read_capped(dec, cap)
-        }
-        Format::Xz | Format::Lzma => {
-            // lzma-rs writes into a sink; cap it with a limited writer
-            let mut w = CapWriter { buf: Vec::new(), cap };
-            let mut input = std::io::BufReader::new(d);
-            let _ = if fmt == Format::Xz {
-                lzma_rs::xz_decompress(&mut input, &mut w)
-            } else {
-                lzma_rs::lzma_decompress(&mut input, &mut w)
-            };
-            if w.buf.is_empty() { None } else { Some(w.buf) }
-        }
-        _ => None,
-    }
-}
-
-struct CapWriter {
-    buf: Vec<u8>,
-    cap: usize,
-}
-
-impl std::io::Write for CapWriter {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        if self.buf.len() >= self.cap {
-            return Err(std::io::Error::other("cap reached"));
-        }
-        let n = data.len().min(self.cap - self.buf.len());
-        self.buf.extend_from_slice(&data[..n]);
-        Ok(data.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 
 // ── text heuristics ─────────────────────────────────────────────────────
 
@@ -181,6 +48,8 @@ static RE_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[A-Za-z/!?][^<>]
 static RE_PCT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"%[0-9A-Fa-f]{2}").unwrap());
 static RE_ESC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\(?:u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2})").unwrap());
 static RE_QP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)quoted-printable").unwrap());
+static RE_EW: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"=\?([A-Za-z0-9_\-:.]+)(?:\*[A-Za-z\-]+)?\?([BbQq])\?([^?\s]*)\?=").unwrap());
 static RE_PDF_TEXT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\)\s*Tj|\]\s*TJ|>\s*Tj").unwrap());
 
 /// All derived text views worth building for this buffer.
@@ -201,6 +70,12 @@ pub fn derived_views(d: &[u8]) -> Vec<View> {
     if RE_PDF_TEXT.is_match(d) {
         out.push(pdf_text(d));
     }
+    if RE_EW.is_match(d) {
+        out.push(mime_words(d));
+    }
+    if d.starts_with(b"{\\rtf") {
+        out.push(rtf_text(d));
+    }
     out
 }
 
@@ -216,10 +91,19 @@ fn strip_markup(d: &[u8]) -> View {
     let mut i = 0;
     let mut last_space = false;
     while i < d.len() {
+        // copy the plain run up to the next '<' or '&' in one go
+        let run = d[i..].iter().position(|&c| c == b'<' || c == b'&').unwrap_or(d.len() - i);
+        if run > 0 {
+            v.data.extend_from_slice(&d[i..i + run]);
+            v.map.extend(i as u32..(i + run) as u32);
+            last_space = d[i + run - 1].is_ascii_whitespace();
+            i += run;
+            continue;
+        }
         let b = d[i];
         if b == b'<'
-            && let Some(m) = RE_TAG.find_at(d, i).filter(|m| m.start() == i) {
-                let tag = &d[m.start() + 1..m.end() - 1];
+            && let Some(tag_end) = tag_at(d, i) {
+                let tag = &d[i + 1..tag_end - 1];
                 let name: Vec<u8> = tag
                     .iter()
                     .skip_while(|&&c| c == b'/')
@@ -231,7 +115,7 @@ fn strip_markup(d: &[u8]) -> View {
                     v.push(b' ', i);
                     last_space = true;
                 }
-                i = m.end();
+                i = tag_end;
                 continue;
             }
         if b == b'&'
@@ -246,6 +130,16 @@ fn strip_markup(d: &[u8]) -> View {
         i += 1;
     }
     v
+}
+
+/// Same rule as RE_TAG, anchored at `i`: returns the index just past '>'.
+fn tag_at(d: &[u8], i: usize) -> Option<usize> {
+    if !matches!(d.get(i + 1), Some(c) if c.is_ascii_alphabetic() || matches!(c, b'/' | b'!' | b'?')) {
+        return None;
+    }
+    let lim = (i + 2 + 400).min(d.len());
+    let rel = d.get(i + 2..lim)?.iter().position(|&c| c == b'>' || c == b'<')?;
+    (d[i + 2 + rel] == b'>').then_some(i + 3 + rel)
 }
 
 fn entity(s: &[u8]) -> Option<(char, usize)> {
@@ -453,6 +347,190 @@ fn pdf_text(d: &[u8]) -> View {
     v
 }
 
+// ── MIME encoded words (RFC 2047): =?UTF-8?B?…?= / =?ISO-8859-1?Q?…?= ──
+
+fn mime_words(d: &[u8]) -> View {
+    let mut v = View::new("mime-header", d.len());
+    let mut last = 0;
+    let mut after_word = false;
+    for c in RE_EW.captures_iter(d) {
+        let m = c.get(0).unwrap();
+        let between = &d[last..m.start()];
+        // whitespace between two adjacent encoded words is not content
+        if !(after_word && between.iter().all(|b| b.is_ascii_whitespace())) {
+            for (k, &b) in between.iter().enumerate() {
+                v.push(b, last + k);
+            }
+        }
+        let charset = String::from_utf8_lossy(&c[1]);
+        let enc = encoding_rs::Encoding::for_label(charset.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+        let body = &c[3];
+        let bytes = if c[2].eq_ignore_ascii_case(b"b") {
+            let usable = if body.len() % 4 == 1 { body.len() - 1 } else { body.len() };
+            B64.decode(&body[..usable]).unwrap_or_default()
+        } else {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < body.len() {
+                match body[i] {
+                    b'_' => out.push(b' '),
+                    b'=' if i + 2 < body.len() + 1 => {
+                        if let (Some(a), Some(b)) = (body.get(i + 1).and_then(|&x| hexval(x)), body.get(i + 2).and_then(|&x| hexval(x))) {
+                            out.push(a << 4 | b);
+                            i += 3;
+                            continue;
+                        }
+                        out.push(b'=');
+                    }
+                    b => out.push(b),
+                }
+                i += 1;
+            }
+            out
+        };
+        let (text, _, _) = enc.decode(&bytes);
+        for ch in text.chars() {
+            v.push_char(ch, m.start());
+        }
+        last = m.end();
+        after_word = true;
+    }
+    for (k, &b) in d[last..].iter().enumerate() {
+        v.push(b, last + k);
+    }
+    v
+}
+
+// ── RTF ──
+
+const RTF_SKIP: &[&str] = &[
+    "fonttbl", "colortbl", "stylesheet", "pict", "themedata", "colorschememapping", "datastore", "latentstyles",
+    "listtable", "listoverridetable", "rsidtbl", "generator", "xmlnstbl", "objdata", "fldinst", "filetbl", "revtbl",
+];
+
+/// Plain text of an RTF document: control words dropped, `\'hh` decoded with
+/// the document code page, `\uN` unicode escapes honoured.
+fn rtf_text(d: &[u8]) -> View {
+    let cp = d
+        .windows(8)
+        .position(|w| w == b"\\ansicpg")
+        .and_then(|p| std::str::from_utf8(&d[p + 8..(p + 13).min(d.len())]).ok().map(|s| s.chars().take_while(char::is_ascii_digit).collect::<String>()))
+        .and_then(|n| encoding_rs::Encoding::for_label(format!("windows-{n}").as_bytes()))
+        .unwrap_or(encoding_rs::WINDOWS_1252);
+    let mut v = View::new("rtf-text", d.len() / 2);
+    let mut stack: Vec<(bool, usize)> = Vec::new();
+    let (mut skip, mut uc) = (false, 1usize);
+    let mut pending: Vec<u8> = Vec::new(); // consecutive \'hh bytes (multi-byte code pages)
+    let mut pending_at = 0;
+    let mut i = 0;
+    let flush = |v: &mut View, pending: &mut Vec<u8>, at: usize| {
+        if !pending.is_empty() {
+            let (t, _) = cp.decode_without_bom_handling(pending);
+            for c in t.chars() {
+                v.push_char(c, at);
+            }
+            pending.clear();
+        }
+    };
+    while i < d.len() {
+        let b = d[i];
+        if !(b == b'\\' && d.get(i + 1) == Some(&b'\'')) {
+            flush(&mut v, &mut pending, pending_at);
+        }
+        match b {
+            b'{' => {
+                stack.push((skip, uc));
+                i += 1;
+            }
+            b'}' => {
+                (skip, uc) = stack.pop().unwrap_or((false, 1));
+                i += 1;
+            }
+            b'\r' | b'\n' => i += 1,
+            b'\\' => {
+                let Some(&n) = d.get(i + 1) else { break };
+                if n.is_ascii_alphabetic() {
+                    let ws = i + 1;
+                    let mut j = ws;
+                    while j < d.len() && d[j].is_ascii_alphabetic() {
+                        j += 1;
+                    }
+                    let word = std::str::from_utf8(&d[ws..j]).unwrap_or("");
+                    let ps = j;
+                    if j < d.len() && (d[j] == b'-' || d[j].is_ascii_digit()) {
+                        j += 1;
+                        while j < d.len() && d[j].is_ascii_digit() {
+                            j += 1;
+                        }
+                    }
+                    let param: Option<i64> = std::str::from_utf8(&d[ps..j]).ok().and_then(|s| s.parse().ok());
+                    if j < d.len() && d[j] == b' ' {
+                        j += 1;
+                    }
+                    match word {
+                        "par" | "line" | "tab" | "cell" | "row" | "sect" | "page" | "emspace" | "enspace" if !skip => v.push(b' ', i),
+                        "u" if !skip => {
+                            let n = param.unwrap_or(0);
+                            let n = if n < 0 { n + 65536 } else { n } as u32;
+                            v.push_char(char::from_u32(n).unwrap_or('·'), i);
+                            // skip the ANSI fallback characters
+                            for _ in 0..uc {
+                                if d.get(j) == Some(&b'\\') && d.get(j + 1) == Some(&b'\'') {
+                                    j += 4;
+                                } else if j < d.len() && d[j] != b'\\' && d[j] != b'{' && d[j] != b'}' {
+                                    j += 1;
+                                }
+                            }
+                        }
+                        "uc" => uc = param.unwrap_or(1).max(0) as usize,
+                        w if RTF_SKIP.contains(&w) => skip = true,
+                        _ => {}
+                    }
+                    i = j;
+                } else {
+                    match n {
+                        b'\'' => {
+                            if let (Some(a), Some(c)) = (d.get(i + 2).and_then(|&x| hexval(x)), d.get(i + 3).and_then(|&x| hexval(x)))
+                                && !skip {
+                                    if pending.is_empty() {
+                                        pending_at = i;
+                                    }
+                                    pending.push(a << 4 | c);
+                                }
+                            i += 4;
+                        }
+                        b'*' => {
+                            skip = true;
+                            i += 2;
+                        }
+                        b'~' => {
+                            if !skip {
+                                v.push(b' ', i);
+                            }
+                            i += 2;
+                        }
+                        b'\\' | b'{' | b'}' => {
+                            if !skip {
+                                v.push(n, i);
+                            }
+                            i += 2;
+                        }
+                        _ => i += 2,
+                    }
+                }
+            }
+            _ => {
+                if !skip {
+                    v.push(b, i);
+                }
+                i += 1;
+            }
+        }
+    }
+    flush(&mut v, &mut pending, pending_at);
+    v
+}
+
 // ── base64 blobs ────────────────────────────────────────────────────────
 
 static B64: LazyLock<GeneralPurpose> = LazyLock::new(|| {
@@ -476,6 +554,12 @@ pub fn base64_blobs(d: &[u8], min_chars: usize, max_blobs: usize) -> Vec<(usize,
     while i < d.len() && out.len() < max_blobs {
         if !is_b64(d[i]) {
             i += 1;
+            continue;
+        }
+        // cheap rejection: a short word not followed by a line break can't start a blob
+        let run = d[i..].iter().position(|&c| !is_b64(c)).unwrap_or(d.len() - i);
+        if run < 16 || (run < min_chars && !matches!(d.get(i + run), Some(b'\r' | b'\n' | b'='))) {
+            i += run.max(1);
             continue;
         }
         let start = i;
@@ -539,86 +623,29 @@ pub fn base64_run_text(d: &[u8], s: usize, e: usize) -> Option<String> {
     Some(txt)
 }
 
-// ── PDF streams ─────────────────────────────────────────────────────────
-
-/// Inflate every FlateDecode stream in a PDF. Returns (offset, decoded).
-pub fn pdf_streams(d: &[u8], cap: usize, max: usize) -> Vec<(usize, Vec<u8>)> {
-    static RE_STREAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?-u)stream\r?\n").unwrap());
-    let mut out = Vec::new();
-    let mut total = 0;
-    for m in RE_STREAM.find_iter(d) {
-        if out.len() >= max || total >= cap {
-            break;
+#[cfg(test)]
+mod bench {
+    use super::*;
+    #[test]
+    #[ignore]
+    #[allow(clippy::type_complexity)]
+    fn views_speed() {
+        let hay = std::fs::read(std::env::var("BENCH_FILE").unwrap()).unwrap();
+        let files: Vec<&[u8]> = hay.chunks(10_000).collect();
+        let mbs = |t: std::time::Instant| format!("{:>7.0} MB/s", hay.len() as f64 / t.elapsed().as_secs_f64() / 1e6);
+        let checks: [(&str, &LazyLock<Regex>); 6] = [("RE_TAG", &RE_TAG), ("RE_QP", &RE_QP), ("RE_PCT", &RE_PCT), ("RE_ESC", &RE_ESC), ("RE_PDF", &RE_PDF_TEXT), ("RE_EW", &RE_EW)];
+        for (n, re) in checks {
+            let t = std::time::Instant::now();
+            let c = files.iter().filter(|f| re.is_match(f)).count();
+            eprintln!("is_match {n:<8} {}  ({c} files)", mbs(t));
         }
-        // look back for the stream dictionary
-        let dict_start = m.start().saturating_sub(512);
-        let dict = &d[dict_start..m.start()];
-        if !dict.windows(11).any(|w| w == b"FlateDecode") {
-            continue;
-        }
-        let body = &d[m.end()..];
-        let body = match body.windows(9).position(|w| w == b"endstream") {
-            Some(p) => &body[..p],
-            None => body,
-        };
-        if let Some(dec) = read_capped(flate2::read::ZlibDecoder::new(body), cap - total) {
-            total += dec.len();
-            out.push((m.end(), dec));
+        let fs: [(&str, fn(&[u8]) -> View); 4] = [("strip_markup", strip_markup), ("percent", percent_decode), ("unescape", unescape), ("pdf_text", pdf_text)];
+        for (n, f) in fs {
+            let t = std::time::Instant::now();
+            for x in &files { std::hint::black_box(f(x)); }
+            eprintln!("build    {n:<12} {}", mbs(t));
         }
     }
-    out
-}
-
-// ── timestamps ──────────────────────────────────────────────────────────
-
-const UNIX_2000: f64 = 946_684_800.0;
-const UNIX_2040: f64 = 2_208_988_800.0;
-const MAC_EPOCH: f64 = 978_307_200.0; // 2001-01-01
-const WEBKIT_EPOCH: f64 = 11_644_473_600.0; // 1601-01-01 → 1970
-
-fn fmt_unix(secs: f64, label: &str) -> String {
-    let utc: DateTime<Utc> = Utc
-        .timestamp_opt(secs.floor() as i64, 0)
-        .single()
-        .unwrap_or_default();
-    let local = utc.with_timezone(&Local);
-    format!(
-        "⟨{label} {} UTC · {} local⟩",
-        utc.format("%Y-%m-%d %H:%M:%S"),
-        local.format("%Y-%m-%d %H:%M:%S")
-    )
-}
-
-/// Human-readable interpretations of a number that looks like a timestamp.
-/// `hinted` = the column/key name suggests a date, which unlocks the riskier epochs.
-pub fn timestamp_notes(v: f64, hinted: bool) -> Option<String> {
-    let mut notes = Vec::new();
-    let in_range = |s: f64| (UNIX_2000..UNIX_2040).contains(&s);
-    if in_range(v) {
-        notes.push(fmt_unix(v, "unix"));
-    } else if in_range(v / 1e3) {
-        notes.push(fmt_unix(v / 1e3, "unix-ms"));
-    } else if in_range(v / 1e6) && hinted {
-        notes.push(fmt_unix(v / 1e6, "unix-µs"));
-    }
-    if hinted || v.fract() != 0.0 {
-        if in_range(v + MAC_EPOCH) && v > 1e8 {
-            notes.push(fmt_unix(v + MAC_EPOCH, "mac"));
-        } else if in_range(v / 1e9 + MAC_EPOCH) && v > 1e16 {
-            notes.push(fmt_unix(v / 1e9 + MAC_EPOCH, "mac-ns"));
-        }
-    }
-    if in_range(v / 1e6 - WEBKIT_EPOCH) && v > 1e16 {
-        notes.push(fmt_unix(v / 1e6 - WEBKIT_EPOCH, "webkit"));
-    }
-    if notes.is_empty() { None } else { Some(notes.join(" ")) }
-}
-
-pub fn name_hints_time(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    ["date", "time", "stamp", "created", "modified", "updated", "visit", "expire", "_at", "last", "when", "start", "end"]
-        .iter()
-        .any(|k| n.contains(k))
 }
 
 #[cfg(test)]
@@ -651,15 +678,22 @@ mod tests {
     }
 
     #[test]
+    fn mime_encoded_words() {
+        let v = mime_words(b"Subject: =?UTF-8?B?UGhvZW5peCBQcm90b2NvbA==?= =?ISO-8859-1?Q?_S=E3o_Paulo?=");
+        assert_eq!(String::from_utf8_lossy(&v.data), "Subject: Phoenix Protocol São Paulo");
+    }
+
+    #[test]
+    fn rtf() {
+        let src = br"{\rtf1\ansi\ansicpg1252{\fonttbl{\f0 Helvetica;}}\f0 The Phoe\b nix\b0  Prot\'f3col S\u227?o Paulo\par}";
+        let v = rtf_text(src);
+        assert_eq!(String::from_utf8_lossy(&v.data).trim(), "The Phoenix Protócol São Paulo");
+    }
+
+    #[test]
     fn pdf_tj() {
         let v = pdf_text(b"BT /F1 12 Tf [(Hel) -20 (lo) -300 (World)] TJ ET");
         assert!(String::from_utf8_lossy(&v.data).contains("Hello World"));
     }
 
-    #[test]
-    fn timestamps() {
-        assert!(timestamp_notes(1_710_460_800.0, false).unwrap().contains("2024-03-15"));
-        assert!(timestamp_notes(732_153_600.0, true).unwrap().contains("mac 2024-03-15"));
-        assert!(timestamp_notes(13_354_934_400_000_000.0, false).unwrap().contains("webkit 2024-03-15"));
-    }
 }

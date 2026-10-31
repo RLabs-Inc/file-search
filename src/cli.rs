@@ -15,6 +15,7 @@ pub struct Cli {
     pub no_export: bool,
     pub formats: Vec<Fmt>,
     pub case_sensitive: bool,
+    pub accent_sensitive: bool,
     pub regex: bool,
     pub hex: bool,
     pub context: usize,
@@ -67,6 +68,7 @@ pub fn parse(args: Vec<String>) -> Result<Parsed, String> {
         no_export: false,
         formats: Fmt::ALL.to_vec(),
         case_sensitive: false,
+        accent_sensitive: false,
         regex: false,
         hex: false,
         context: 40,
@@ -130,6 +132,7 @@ pub fn parse(args: Vec<String>) -> Result<Parsed, String> {
                 c.formats = f;
             }
             "-c" | "--case" | "--case-sensitive" | "-case" => c.case_sensitive = true,
+            "-a" | "--accents" | "--accent-sensitive" => c.accent_sensitive = true,
             "-r" | "--regex" | "-regex" => c.regex = true,
             "-x" | "--hex" | "-hex" => c.hex = true,
             "-C" | "--context" | "-context" => {
@@ -217,6 +220,7 @@ pub fn help() -> String {
         ("--formats <list>", "csv,txt,jsonl,html,md (default: all)"),
         ("--no-export", "only show results on screen"),
         ("-c, --case", "case-sensitive (default: insensitive)"),
+        ("-a, --accents", "accent-sensitive (default: São = Sao = SÃO)"),
         ("-r, --regex", "treat the text as a regular expression"),
         ("-x, --hex", "treat the text as hex bytes (auto for 0x… / hex:…)"),
         ("-C, --context <n>", "characters of context on each side (default 40)"),

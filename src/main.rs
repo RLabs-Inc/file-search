@@ -1,5 +1,5 @@
 mod cli;
-mod decode;
+mod formats;
 mod export;
 mod hit;
 mod matcher;
@@ -60,7 +60,7 @@ fn main() {
     };
 
     // ── matcher ──
-    let m = Matcher::new(&cli.needle, &MatcherOptions { case_sensitive: cli.case_sensitive, regex: cli.regex, hex: cli.hex })
+    let m = Matcher::new(&cli.needle, &MatcherOptions { case_sensitive: cli.case_sensitive, accent_sensitive: cli.accent_sensitive, regex: cli.regex, hex: cli.hex })
         .unwrap_or_else(|e| fail(&e));
     let variants: Vec<String> = m.variants.iter().map(|(_, d)| d.clone()).collect();
 

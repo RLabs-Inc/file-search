@@ -22,6 +22,12 @@ use matcher::{Matcher, MatcherOptions};
 use scan::{Config, Event, Slot, Stats, Worker};
 use ui::*;
 
+/// Give the terminal back exactly as we found it.
+pub fn restore_terminal() {
+    prism::raw_mode_reset();
+    prism::show_cursor();
+}
+
 fn fail(msg: &str) -> ! {
     eprintln!("\n  {} {}\n", cb(RED, "✗"), msg);
     std::process::exit(2);
@@ -127,7 +133,7 @@ fn main() {
         let st = Arc::clone(&stats);
         let _ = ctrlc::set_handler(move || {
             if st.cancel.swap(true, Relaxed) {
-                prism::show_cursor();
+                restore_terminal();
                 eprintln!("\n  aborted.");
                 std::process::exit(130);
             }
@@ -138,6 +144,10 @@ fn main() {
     let ly = prism::layout(Some(LayoutOptions { tty: Some(live_tty()), ..Default::default() }));
     let tty = live_tty();
     if tty {
+        // Like wifikit: raw *input* mode for the whole run (output untouched).
+        // Terminals such as Warp then treat us as a live app and render the
+        // scrollback + status zone in real time; typed keys don't garble it.
+        prism::raw_mode(true);
         prism::hide_cursor();
     }
     {
@@ -184,6 +194,19 @@ fn main() {
         let mut last_draw = Instant::now();
         let mut last_flush = Instant::now();
         loop {
+            // in raw mode Ctrl-C arrives as a key, not a signal
+            if tty {
+                while let Ok(Some(k)) = prism::keypress_poll(Duration::ZERO) {
+                    if k.ctrl && k.key == "c" {
+                        if stats.cancel.swap(true, Relaxed) {
+                            restore_terminal();
+                            eprintln!("\n  aborted.");
+                            std::process::exit(130);
+                        }
+                        ly.refresh();
+                    }
+                }
+            }
             let first = ev_rx.recv_timeout(Duration::from_millis(40));
             let mut batch = Vec::new();
             match first {
@@ -259,7 +282,7 @@ fn main() {
 
     ly.close(None);
     if tty {
-        prism::show_cursor();
+        restore_terminal();
     }
 
     // ── summary ──

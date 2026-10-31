@@ -81,7 +81,7 @@ pub fn install_panic_hook() {
             let msg = info.to_string();
             LAST_PANIC.with(|p| *p.borrow_mut() = msg);
         } else {
-            prism::show_cursor();
+            crate::restore_terminal();
             default(info);
         }
     }));
